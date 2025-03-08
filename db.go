@@ -2,7 +2,6 @@ package pgrst
 
 import (
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -10,9 +9,8 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwk"
-	"github.com/lestrrat-go/jwx/v2/jws"
+	"github.com/handletec/simpleauthn"
+	"github.com/lestrrat-go/jwx/v3/jws"
 	"github.com/svicknesh/httpclient"
 )
 
@@ -28,9 +26,9 @@ const (
 // DB - remote DB information
 type DB struct {
 	client            *httpclient.Request
-	duration          time.Duration
+	expiryDuration    time.Duration
 	jsvo              jws.SignVerifyOption
-	authz             authz
+	role              string
 	method            httpMethod
 	endpoint          string
 	qVal              url.Values
@@ -38,46 +36,48 @@ type DB struct {
 	success, debug    bool
 	dbResponse        DBResponse
 	start, end, total int
+	keyPrivate        *simpleauthn.Key
 }
 
 // authz - authorization token with remote server
 type authz struct {
-	Expiry int64  `json:"exp"`
-	Role   string `json:"role"`
+	*simpleauthn.Claim        // import default claims, which includes `iat`, `nbf` and `exp`
+	Role               string `json:"role"`
 }
 
 // New - creates new instance of Database
-func New(address, role, secret string, duration time.Duration) (db *DB, err error) {
+func New(address, role, secret string, expiryDuration time.Duration, tlsConfig *tls.Config) (db *DB, err error) {
 
 	db = new(DB)
 
-	db.client = httpclient.NewRequest(address, time.Duration(time.Second*30), &tls.Config{InsecureSkipVerify: true}, nil)
-	db.client.SetUserAgent("pgrst-golang/v1.0")
+	db.client = httpclient.NewRequest(address, time.Duration(time.Second*30), tlsConfig, nil)
+	db.client.SetUserAgent("pgrst-golang/v1.1")
 
-	secretKey, err := jwk.FromRaw([]byte(secret))
+	// parse the secret to determine what algorithm to use
+	db.keyPrivate, err = simpleauthn.NewKey(simpleauthn.AlgForKey(secret), secret)
 	if nil != err {
-		return nil, fmt.Errorf("newdb: jwk raw error -> %w", err)
+		return nil, fmt.Errorf("newdb: %w", err)
 	}
 
+	// for this, we only accept private key since we will be signing it to send to PostgREST
+	if !db.keyPrivate.IsPrivate() {
+		return nil, fmt.Errorf("newdb: expected private key for signing requests")
+	}
+
+	/*
+		secretKey, err := jwk.Import([]byte(secret))
+		if nil != err {
+			return nil, fmt.Errorf("newdb: jwk raw error -> %w", err)
+		}
+		db.jsvo = jws.WithKey(jwa.HS256, secretKey)
+	*/
+
 	db.qVal = make(url.Values)
-	db.duration = duration
+	db.expiryDuration = expiryDuration
 
-	db.jsvo = jws.WithKey(jwa.HS256, secretKey)
-
-	db.authz.Role = role
+	db.role = role
 
 	return
-}
-
-// genToken - creates an auth token with the given role for request
-func (db *DB) genToken() (token string) {
-
-	db.authz.Expiry = time.Now().Add(db.duration).UTC().Unix()
-
-	bytes, _ := json.Marshal(db.authz)
-	buf, _ := jws.Sign(bytes, db.jsvo)
-
-	return string(buf)
 }
 
 // NewSelect - returns a new instance for selecting data
@@ -135,7 +135,7 @@ func (db *DB) Table(tableName string) *DB {
 
 // SetRole - sets the name of the role to use for this request
 func (db *DB) SetRole(role string) *DB {
-	db.authz.Role = role
+	db.role = role
 	return db
 }
 
@@ -169,7 +169,16 @@ func (db *DB) Exec() (err error) {
 	}
 
 	//fmt.Println(db.endpoint + db.qVal.Encode())
-	db.client.SetHeader("Authorization", "Bearer "+db.genToken())
+	a := new(authz)
+	a.Claim = simpleauthn.NewClaim(db.expiryDuration)
+	a.Role = db.role
+	token, err := simpleauthn.NewRequest(db.keyPrivate, a)
+	if nil != err {
+		return fmt.Errorf("exec: %w", err)
+	}
+
+	// set the authorization header
+	db.client.SetHeader("Authorization", "Bearer "+token)
 
 	var response *httpclient.Response
 
