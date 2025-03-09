@@ -129,7 +129,6 @@ The following functions are available in this library
 | `SetRole` | overrides the `role` configured in `New`.  |
 | `Input` | sets the input for inserting, upserting, or updating data. The `json` fields **MUST** match the column names in the related tables.  |
 | `Output` | sets the pointer to a structure to store the result. The type can be a `slice`, `struct` or `string`. |
-| `Debug` | prints the request being sent and the response received to the console. |
 | `Exec` | Executes the chained requet.  |
 | `Select` | define the fields to be returned from the `NewSelect` request.  |
 | `Where` | sets the condition for the request. Refer to teh `Constants` section for futher explanation.  |

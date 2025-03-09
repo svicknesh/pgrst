@@ -4,7 +4,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -33,10 +32,13 @@ type DB struct {
 	endpoint          string
 	qVal              url.Values
 	input, output     any
-	success, debug    bool
-	dbResponse        DBResponse
+	success           bool
+	dbResponse        *DBResponse
 	start, end, total int
 	keyPrivate        *simpleauthn.Key
+	token             string
+	tokenRenew        int64
+	//logger            *slog.Logger
 }
 
 // authz - authorization token with remote server
@@ -64,18 +66,12 @@ func New(address, role, secret string, expiryDuration time.Duration, tlsConfig *
 		return nil, fmt.Errorf("newdb: expected private key for signing requests")
 	}
 
-	/*
-		secretKey, err := jwk.Import([]byte(secret))
-		if nil != err {
-			return nil, fmt.Errorf("newdb: jwk raw error -> %w", err)
-		}
-		db.jsvo = jws.WithKey(jwa.HS256, secretKey)
-	*/
-
 	db.qVal = make(url.Values)
 	db.expiryDuration = expiryDuration
 
 	db.role = role
+	db.dbResponse = new(DBResponse)
+	//db.logger = logger
 
 	return
 }
@@ -151,12 +147,6 @@ func (db *DB) Output(output any) *DB {
 	return db
 }
 
-// Debug - prints the HTTP Status code and any messages received to console
-func (db *DB) Debug() *DB {
-	db.debug = true
-	return db
-}
-
 // Exec - executes this query
 func (db *DB) Exec() (err error) {
 
@@ -168,17 +158,21 @@ func (db *DB) Exec() (err error) {
 		}
 	}
 
-	//fmt.Println(db.endpoint + db.qVal.Encode())
-	a := new(authz)
-	a.Claim = simpleauthn.NewClaim(db.expiryDuration)
-	a.Role = db.role
-	token, err := simpleauthn.NewRequest(db.keyPrivate, a)
-	if nil != err {
-		return fmt.Errorf("exec: %w", err)
+	// generate JWT for PostgREST
+	// for performance gain, we keep the generated token for a period, speeding up requests.
+	if db.tokenRenew < time.Now().UTC().Unix() {
+		a := new(authz)
+		a.Claim = simpleauthn.NewClaim(db.expiryDuration)
+		a.Role = db.role
+		db.token, err = simpleauthn.NewRequest(db.keyPrivate, a)
+		if nil != err {
+			return fmt.Errorf("exec: %w", err)
+		}
+		db.tokenRenew = int64(float64(a.Claim.Expiry) * 0.8) // we keep the maximum cached token up to 80% of the expiry lifetime
 	}
 
 	// set the authorization header
-	db.client.SetHeader("Authorization", "Bearer "+token)
+	db.client.SetHeader("Authorization", "Bearer "+db.token)
 
 	var response *httpclient.Response
 
@@ -202,9 +196,7 @@ func (db *DB) Exec() (err error) {
 		err = fmt.Errorf("exec: SELECT, INSERT, UPSERT, UPDATE or DELETE not specified")
 	}
 
-	if db.debug {
-		log.Printf("debug -> HTTP Status Code (%d), HTTP Response -> %s", response.StatusCode, response.Buffer.String())
-	}
+	//db.logger.Debug("debug HTTP response", "status_code", response.StatusCode, "http_response", response.Buffer.String())
 
 	//fmt.Println(response)
 	//fmt.Println("1", response.StatusCode, db.method, response.Buffer.String())
@@ -234,7 +226,6 @@ func (db *DB) Exec() (err error) {
 				db.success = false
 			}
 		default:
-			//fmt.Println("2", response.StatusCode, db.method, response.Buffer.String())
 			// other methods can be assumed to be successful
 			db.success = true
 		}
@@ -252,14 +243,14 @@ func (db *DB) Exec() (err error) {
 
 	case http.StatusConflict:
 		// this happens for INSERT when there is a conflicting rule, save the database response
-		response.ToJSON(&db.dbResponse)
+		response.ToJSON(db.dbResponse)
 		db.dbResponse.HTTPStatusCode = response.StatusCode
 
 		return
 
 	default:
 		// any other HTTP status return it as an error
-		response.ToJSON(&db.dbResponse)
+		response.ToJSON(db.dbResponse)
 		db.dbResponse.HTTPStatusCode = response.StatusCode
 
 		return fmt.Errorf("exec: error completing request -> %s", db.dbResponse.String())
